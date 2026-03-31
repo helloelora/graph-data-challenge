@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+*.zip
+submission_*.csv
