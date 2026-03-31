@@ -4,9 +4,9 @@
 
 | Strategy | Code | Submission CSV | Local CV AUC | Local CV Acc@0.5 | Kaggle Score |
 |----------|------|----------------|-------------|------------------|--------------|
-| LR Baseline | `train_link_predictor_lr_baseline.py` | `submission_lr_baseline.csv` | 0.5662 | 0.6180 | — |
-| HGB Intermediate | `train_link_predictor_hgb_intermediate.py` | `submission_hgb_intermediate.csv` | 0.5648 | 0.6288 | **0.84927** |
-| Best Ensemble | `train_link_predictor.py` | `submission_best.csv` | 0.5371 | 0.5685 | 0.76833 |
+| Logistic Regression | `logistic_regression.py` | `submission_lr_baseline.csv` | 0.5662 | 0.6180 | — |
+| HistGradientBoosting | `hist_gradient_boosting.py` | `submission_hgb_intermediate.csv` | 0.5648 | 0.6288 | **0.84927** |
+| XGB+HGB+LR Ensemble | `xgb_hgb_lr_ensemble.py` | `submission_best.csv` | 0.5371 | 0.5685 | 0.76833 |
 
 > Local CV metrics are strict out-of-fold scores on `train.txt` (graph rebuilt per fold, no leakage).
 > Kaggle score is the public leaderboard AUC.
@@ -15,7 +15,7 @@
 
 ## Strategy details
 
-### 1. LR baseline (`train_link_predictor_lr_baseline.py`)
+### 1. Logistic Regression (`logistic_regression.py`)
 
 **Model:** Logistic Regression (with StandardScaler), C=0.7
 
@@ -27,17 +27,17 @@
 
 ---
 
-### 2. HGB intermediate (`train_link_predictor_hgb_intermediate.py`)
+### 2. HistGradientBoosting (`hist_gradient_boosting.py`)
 
 **Model:** HistGradientBoostingClassifier (lr=0.07, max_depth=4, max_iter=250, min_samples_leaf=30)
 
-**Features:** Same 16 compact features as the LR Baseline (imports `build_features` from `train_link_predictor_lr_baseline.py`)
+**Features:** Same 16 compact features as Logistic Regression (imports `build_features` from `logistic_regression.py`)
 
 **Approach:** Replaces the linear model with a gradient boosting tree to capture non-linear feature interactions, while keeping the same simple feature set. Best Kaggle score.
 
 ---
 
-### 3. Best ensemble (`train_link_predictor.py`)
+### 3. XGB+HGB+LR Ensemble (`xgb_hgb_lr_ensemble.py`)
 
 **Models (blended with optimized weights):**
 - XGBoost (n_estimators=600, lr=0.04, max_depth=6)

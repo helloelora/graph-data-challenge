@@ -6,7 +6,7 @@ from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.metrics import average_precision_score, roc_auc_score
 from sklearn.model_selection import StratifiedKFold
 
-from train_link_predictor_lr_baseline import (
+from logistic_regression import (
     build_features,
     build_graph,
     load_data,
