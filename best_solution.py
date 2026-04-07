@@ -1,13 +1,12 @@
 """
-Link Prediction v16b — New structural & text signals with leakage correction.
+Link Prediction v19 — v16b features (proven 0.867) + feature interactions + more seeds.
 
-Additions over v12 (0.861):
-  1. Paths of length 3 (A³) — corrected for edge leakage in training
-  2. Neighborhood text similarity — corrected for edge leakage in training
-  3. Separated train/test pair counts
-  4. Katz-like index
-  5. Hub-promoted / hub-depressed indices
-  6. Sorensen index
+PPR leaked badly — dropping it. Instead:
+  1. Keep exact v16b features (36, proven 0.867)
+  2. Add targeted feature interactions (graph × text signals)
+  3. More seeds (30) for stability
+  4. HGB + CatBoost rank blend
+  5. Rank-blend with v16b for safety
 """
 
 import math
@@ -17,6 +16,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from scipy import sparse
+from scipy.stats import rankdata
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.feature_extraction.text import TfidfTransformer
 from sklearn.metrics import roc_auc_score
@@ -124,7 +124,7 @@ def build_features(
         deg_u_eff = deg_u
         deg_v_eff = deg_v
 
-    # --- Classic graph heuristics ---
+    # Classic graph heuristics
     cn = np.zeros(n, dtype=np.float32)
     aa = np.zeros(n, dtype=np.float32)
     ra = np.zeros(n, dtype=np.float32)
@@ -149,7 +149,7 @@ def build_features(
     same_comp = (comp[u] == comp[v]).astype(np.float32)
     both_iso = ((deg_u == 0) & (deg_v == 0)).astype(np.float32)
 
-    # --- Text features ---
+    # Text features
     fu, fv = node_features[u], node_features[v]
     raw_dot = np.einsum("ij,ij->i", fu, fv).astype(np.float32)
     norm_u = np.linalg.norm(fu, axis=1).astype(np.float32)
@@ -172,74 +172,54 @@ def build_features(
     overlap_u = raw_dot / np.maximum(nnz_u, 1.0)
     overlap_v = raw_dot / np.maximum(nnz_v, 1.0)
 
-    # --- Transductive pair counts ---
+    # Transductive pair counts
     tc_u = total_count[u]
     tc_v = total_count[v]
     tec_u = test_count[u]
     tec_v = test_count[v]
 
-    # --- Paths of length 3 (A³) with leakage correction ---
-    # A³[u,v] counts all walks of length 3. For positive training pairs,
-    # the direct edge u-v contributes deg(u) + deg(v) - 1 spurious walks.
+    # Paths of length 3 with leakage correction
     A2 = adj_matrix @ adj_matrix
     A3 = adj_matrix @ A2
     paths3 = np.zeros(n, dtype=np.float32)
     for i in range(n):
         paths3[i] = A3[int(u[i]), int(v[i])]
     if is_pos is not None:
-        # Subtract leakage for positive training pairs
         leakage = (deg_u + deg_v - 1.0) * is_pos.astype(np.float32)
         paths3 = np.maximum(paths3 - leakage, 0.0)
 
-    # Katz-like: β²·CN + β³·paths3
     beta = 0.005
     katz = (beta ** 2) * cn + (beta ** 3) * paths3
 
-    # --- Neighborhood text similarity with leakage correction ---
-    # neighbor_tfidf[u] = (1/deg(u)) * Σ_{w ∈ N(u)} tfidf(w)
-    # For positive pair (u,v): v ∈ N(u), so we correct by removing v's contribution
-    ntfidf_u = neighbor_tfidf[u]  # sparse (n, d)
-    ntfidf_v = neighbor_tfidf[v]  # sparse (n, d)
+    # Neighborhood text similarity with leakage correction
+    ntfidf_u = neighbor_tfidf[u]
+    ntfidf_v = neighbor_tfidf[v]
     tfidf_u_sp = node_tfidf[u]
     tfidf_v_sp = node_tfidf[v]
 
     if is_pos is not None:
-        # For positive pairs: corrected_ntfidf_u = (d_u * ntfidf_u - tfidf_v) / max(d_u - 1, 1)
-        # Build corrected versions only for positive pairs
-        d_u_arr = deg_u.reshape(-1, 1)  # (n, 1)
+        d_u_arr = deg_u.reshape(-1, 1)
         d_v_arr = deg_v.reshape(-1, 1)
-
-        # Convert to dense for correction (only n pairs × d features)
         ntfidf_u_dense = np.asarray(ntfidf_u.todense())
         ntfidf_v_dense = np.asarray(ntfidf_v.todense())
         tfidf_u_dense = np.asarray(tfidf_u_sp.todense())
         tfidf_v_dense = np.asarray(tfidf_v_sp.todense())
-
         pos_mask = is_pos.astype(np.float32).reshape(-1, 1)
 
-        # Corrected neighbor tfidf for u (removing v's contribution for positive pairs)
-        corr_ntfidf_u = ntfidf_u_dense.copy()
-        corr_denom_u = np.maximum(d_u_arr - 1.0, 1.0)
         corr_ntfidf_u = np.where(
             pos_mask > 0,
-            (d_u_arr * ntfidf_u_dense - tfidf_v_dense) / corr_denom_u,
+            (d_u_arr * ntfidf_u_dense - tfidf_v_dense) / np.maximum(d_u_arr - 1.0, 1.0),
             ntfidf_u_dense,
         )
-        # Corrected neighbor tfidf for v (removing u's contribution for positive pairs)
-        corr_ntfidf_v = ntfidf_v_dense.copy()
-        corr_denom_v = np.maximum(d_v_arr - 1.0, 1.0)
         corr_ntfidf_v = np.where(
             pos_mask > 0,
-            (d_v_arr * ntfidf_v_dense - tfidf_u_dense) / corr_denom_v,
+            (d_v_arr * ntfidf_v_dense - tfidf_u_dense) / np.maximum(d_v_arr - 1.0, 1.0),
             ntfidf_v_dense,
         )
-
-        # cos(corrected_ntfidf_u, tfidf_v)
         neigh_text_uv = np.einsum("ij,ij->i", corr_ntfidf_u, tfidf_v_dense).astype(np.float32)
         neigh_text_vu = np.einsum("ij,ij->i", corr_ntfidf_v, tfidf_u_dense).astype(np.float32)
         neigh_text_nn = np.einsum("ij,ij->i", corr_ntfidf_u, corr_ntfidf_v).astype(np.float32)
     else:
-        # No correction needed for test pairs
         neigh_text_uv = np.asarray(
             ntfidf_u.multiply(tfidf_v_sp).sum(axis=1)
         ).ravel().astype(np.float32)
@@ -250,14 +230,21 @@ def build_features(
             ntfidf_u.multiply(ntfidf_v).sum(axis=1)
         ).ravel().astype(np.float32)
 
-    # --- Hub indices ---
+    # Hub indices
     min_deg = np.minimum(deg_u_eff, deg_v_eff)
     max_deg = np.maximum(deg_u_eff, deg_v_eff)
     hub_promoted = cn / np.maximum(min_deg, 1.0)
     hub_depressed = cn / np.maximum(max_deg, 1.0)
 
+    # === Feature interactions (graph × text) ===
+    cn_x_tfidf = cn * tfidf_cosine
+    cn_x_cosine = cn * raw_cosine
+    pa_x_cosine = pa * raw_cosine
+    same_comp_x_tfidf = same_comp * tfidf_cosine
+    paths3_x_tfidf = paths3 * tfidf_cosine
+
     return np.column_stack([
-        # v4 base (20 features)
+        # v4 base (20)
         deg_u_eff, deg_v_eff,
         np.abs(deg_u_eff - deg_v_eff), deg_u_eff + deg_v_eff,
         np.log1p(deg_u_eff), np.log1p(deg_v_eff),
@@ -266,17 +253,19 @@ def build_features(
         raw_dot, raw_cosine, keyword_jaccard,
         tfidf_cosine, tfidf_l2,
         overlap_u, overlap_v,
-        # v12 transductive (4 features)
+        # v12 transductive (4)
         tc_u, tc_v, tc_u * tc_v, np.abs(tc_u - tc_v),
-        # v16 NEW features
-        tec_u, tec_v,                       # test-only pair counts
-        paths3,                             # paths of length 3 (corrected)
-        katz,                               # Katz-like index
-        neigh_text_uv, neigh_text_vu,       # neighbor text similarity (corrected)
-        neigh_text_nn,                      # neighborhood-to-neighborhood
-        hub_promoted, hub_depressed,        # hub indices
-        sorensen,                           # Sorensen index
-        min_deg, max_deg,                   # sorted degrees
+        # v16 new (12)
+        tec_u, tec_v,
+        paths3, katz,
+        neigh_text_uv, neigh_text_vu, neigh_text_nn,
+        hub_promoted, hub_depressed,
+        sorensen,
+        min_deg, max_deg,
+        # v19 interactions (5)
+        cn_x_tfidf, cn_x_cosine,
+        pa_x_cosine, same_comp_x_tfidf,
+        paths3_x_tfidf,
     ]).astype(np.float32)
 
 
@@ -304,26 +293,24 @@ def main():
         total_count[u] += 1; total_count[v] += 1
         test_count[u] += 1; test_count[v] += 1
 
-    # --- Self-training round (threshold 0.95) ---
+    # --- Self-training (single round, 0.95 threshold — proven) ---
     adj0, deg0, comp0 = build_graph(train_pairs, y_train, n_nodes)
     A0 = build_sparse_adj(adj0, n_nodes)
     d_inv0 = np.zeros(n_nodes, dtype=np.float32)
-    mask0 = deg0 > 0
-    d_inv0[mask0] = 1.0 / deg0[mask0]
+    m0 = deg0 > 0
+    d_inv0[m0] = 1.0 / deg0[m0]
     ntfidf0 = sparse.diags(d_inv0) @ A0 @ node_tfidf
 
     X_tr0 = build_features(
         train_pairs, adj0, deg0, comp0, node_features, node_tfidf,
         total_count, train_count, test_count,
-        A0, ntfidf0,
-        y=y_train, remove_pos=True,
+        A0, ntfidf0, y=y_train, remove_pos=True,
     )
     X_te0 = build_features(
         test_pairs, adj0, deg0, comp0, node_features, node_tfidf,
         total_count, train_count, test_count,
         A0, ntfidf0,
     )
-    print(f"[features] {X_tr0.shape[1]} features")
 
     pred_init = np.zeros(len(test_pairs), dtype=np.float64)
     for s in range(5):
@@ -335,11 +322,10 @@ def main():
         m.fit(X_tr0, y_train)
         pred_init += m.predict_proba(X_te0)[:, 1]
     pred_init /= 5
-
     extra_edges = test_pairs[pred_init >= 0.95]
     print(f"[self-train] +{len(extra_edges)} pseudo-edges")
 
-    # --- Rebuild graph with pseudo-edges ---
+    # --- Rebuild with pseudo-edges ---
     adjacency, degree, comp = build_graph(train_pairs, y_train, n_nodes, extra_edges)
     adj_matrix = build_sparse_adj(adjacency, n_nodes)
     d_inv = np.zeros(n_nodes, dtype=np.float32)
@@ -358,7 +344,7 @@ def main():
         total_count, train_count, test_count,
         adj_matrix, neighbor_tfidf,
     )
-    print(f"[final features] {X_train.shape[1]}")
+    print(f"[features] {X_train.shape[1]}")
 
     # --- CV ---
     cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED)
@@ -371,11 +357,10 @@ def main():
         )
         m.fit(X_train[tr], y_train[tr])
         oof[va] = m.predict_proba(X_train[va])[:, 1]
-        print(f"  fold {fold}/5 AUC={roc_auc_score(y_train[va], oof[va]):.5f}")
-    print(f"  OOF AUC={roc_auc_score(y_train, oof):.5f}")
+    print(f"  HGB OOF={roc_auc_score(y_train, oof):.5f}")
 
-    # --- Final predictions: HGB 15-seed ---
-    n_seeds = 15
+    # --- Final: 30-seed HGB ---
+    n_seeds = 30
     pred_hgb = np.zeros(len(test_pairs), dtype=np.float64)
     for s in range(n_seeds):
         m = HistGradientBoostingClassifier(
@@ -387,27 +372,60 @@ def main():
         pred_hgb += m.predict_proba(X_test)[:, 1]
     pred_hgb /= n_seeds
 
-    # Also do CatBoost blend if available
+    # --- 30-seed CatBoost ---
     if HAS_CATBOOST:
         pred_cat = np.zeros(len(test_pairs), dtype=np.float64)
         for s in range(n_seeds):
-            m = CatBoostClassifier(
+            mc = CatBoostClassifier(
                 iterations=300, learning_rate=0.05, depth=3,
                 l2_leaf_reg=10, random_seed=SEED + s * 31, verbose=0,
             )
-            m.fit(X_train, y_train)
-            pred_cat += m.predict_proba(X_test)[:, 1]
+            mc.fit(X_train, y_train)
+            pred_cat += mc.predict_proba(X_test)[:, 1]
         pred_cat /= n_seeds
-        pred_blend = np.clip(0.5 * pred_hgb + 0.5 * pred_cat, 0, 1).astype(np.float32)
-        out2 = Path("submission_v16b_blend.csv")
-        pd.DataFrame({"ID": np.arange(len(pred_blend)), "Predicted": pred_blend}).to_csv(out2, index=False)
-        print(f"[output] {out2}  min={pred_blend.min():.5f} max={pred_blend.max():.5f}")
 
-    pred_hgb = np.clip(pred_hgb, 0, 1).astype(np.float32)
-    out1 = Path("submission_v16b_hgb.csv")
-    pd.DataFrame({"ID": np.arange(len(pred_hgb)), "Predicted": pred_hgb}).to_csv(out1, index=False)
-    print(f"[output] {out1}  min={pred_hgb.min():.5f} max={pred_hgb.max():.5f}")
-    print(f"[done] {time.time() - t0:.1f}s")
+    # --- Output submissions ---
+    # 1) Pure HGB 30-seed
+    pred_hgb_f = np.clip(pred_hgb, 0, 1).astype(np.float32)
+    out1 = Path("submission_v19_hgb.csv")
+    pd.DataFrame({"ID": np.arange(len(pred_hgb_f)), "Predicted": pred_hgb_f}).to_csv(out1, index=False)
+    print(f"[output] {out1}")
+
+    # 2) HGB+CatBoost rank blend
+    if HAS_CATBOOST:
+        rank_h = rankdata(pred_hgb)
+        rank_c = rankdata(pred_cat)
+        blend_rank = 0.5 * rank_h + 0.5 * rank_c
+        blend_rank = ((blend_rank - blend_rank.min()) / (blend_rank.max() - blend_rank.min() + EPS)).astype(np.float32)
+        out2 = Path("submission_v19_hgb_cat_rank.csv")
+        pd.DataFrame({"ID": np.arange(len(blend_rank)), "Predicted": blend_rank}).to_csv(out2, index=False)
+        print(f"[output] {out2}")
+
+    # 3) Rank-blend with v16b (proven 0.867)
+    v16b_path = Path("submission_v16b_blend.csv")
+    if v16b_path.exists():
+        v16b_pred = pd.read_csv(v16b_path)["Predicted"].to_numpy()
+        rank_v16b = rankdata(v16b_pred)
+        rank_v19 = rankdata(pred_hgb)
+        for w16 in [0.3, 0.5]:
+            w19 = 1.0 - w16
+            blended = w16 * rank_v16b + w19 * rank_v19
+            blended = ((blended - blended.min()) / (blended.max() - blended.min() + EPS)).astype(np.float32)
+            tag = f"{int(w16*100)}v16b_{int(w19*100)}v19"
+            out = Path(f"submission_v19_rankblend_{tag}.csv")
+            pd.DataFrame({"ID": np.arange(len(blended)), "Predicted": blended}).to_csv(out, index=False)
+            print(f"[output] {out}")
+
+        # HGB+Cat blend with v16b
+        if HAS_CATBOOST:
+            rank_hc = rankdata(0.5 * pred_hgb + 0.5 * pred_cat)
+            blend3 = 0.4 * rank_v16b + 0.6 * rank_hc
+            blend3 = ((blend3 - blend3.min()) / (blend3.max() - blend3.min() + EPS)).astype(np.float32)
+            out3 = Path("submission_v19_full_blend.csv")
+            pd.DataFrame({"ID": np.arange(len(blend3)), "Predicted": blend3}).to_csv(out3, index=False)
+            print(f"[output] {out3}")
+
+    print(f"\n[done] {time.time() - t0:.1f}s")
 
 
 if __name__ == "__main__":
