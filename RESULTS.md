@@ -1,6 +1,6 @@
 # Link Prediction — Results Summary
 
-🥇 **Best Kaggle public AUC: 0.88491 (1st place)** with `submission_v26L.csv`
+🥇 **Best Kaggle public AUC: 0.88822 (1st place)** with `submission_v26R.csv`
 
 ## Full progression of submissions
 
@@ -30,7 +30,9 @@
 | HGB v26g (v26d + text-weighted Louvain community, 66 features) | `experiments_v26g.py` | `submission_v26g.csv` | 0.90794 | 0.88080 |
 | HGB v26h_pure (v26g + 20-seed Louvain consensus, 67 features) | `experiments_v26h_pure.py` | `submission_v26h_pure.csv` | 0.90936 | 0.88432 |
 | HGB v26i (v26h_pure + canonical partition + cons_sizes) — regressed | `experiments_v26i.py` | `submission_v26i.csv` | 0.91129 | 0.88389 |
-| **HGB v26L (v26h_pure + multi-res consensus, 70 features)** 🥇 | `experiments_v26L.py` | `submission_v26L.csv` | 0.91157 | **0.88491** |
+| HGB v26L (v26h_pure + multi-res consensus, 70 features) | `experiments_v26L.py` | `submission_v26L.csv` | 0.91157 | 0.88491 |
+| HGB v26Q (v26L + rank-4 SVD cosine, 71 features) | `experiments_v26Q.py` | `submission_v26Q.csv` | 0.91251 | 0.88653 |
+| **HGB v26R (v26Q + svd3_cos + svd4_had3, 73 features)** 🥇 | `experiments_v26R.py` | `submission_v26R.csv` | 0.91359 | **0.88822** |
 
 > OOF AUCs are inflated by the transductive features (computed once on train+test). Kaggle score is the public leaderboard AUC.
 
@@ -160,6 +162,72 @@ Both HGB and CatBoost improved by exactly +0.00088 on the winners-only set — u
 
 ---
 
+## The SVD role-similarity breakthrough: v26Q and v26R
+
+### v26Q (0.88491 → 0.88653, +0.00162)
+
+After v26L the consensus-Louvain direction saturated. Nine consecutive attempts to extend it failed: v26i (canonical partition) regressed Kaggle, v26M (consensus on weighted graphs) flatlined, v26N (extreme resolutions) regressed, v26O (adversarial pruning) found nothing to drop, v26P (multi-round self-training) regressed. The whole "global community structure" vein was exhausted.
+
+The breakthrough came from a **completely different factorization of the candidate adjacency**: truncated SVD. The Laplacian spectral features in v26b capture *soft clustering geometry* (nodes in the same cluster have similar eigenvectors). SVD of the raw adjacency captures *role similarity* — two nodes that connect to the same set of other nodes get similar coordinates regardless of whether they're in the same cluster. Two actors can sit in different Louvain clusters but still look structurally identical (both connect to the same bridging hubs), and the adjacency SVD finds them while any clustering method misses them.
+
+We factor the candidate adjacency at rank 4 (low rank prevents overfitting — higher ranks like 8 hurt). Per-pair feature is the cosine similarity between u and v in the rank-4 SVD space. A single scalar column:
+
+```
+v26L blend OOF   = 0.91157
++svd4_cos        = 0.91251   (+0.00094 blend OOF)
+
+Kaggle: 0.88491 → 0.88653    (+0.00162)
+```
+
+The 1.72× OOF-to-Kaggle ratio is in the "real orthogonal signal" zone, comparable to v26h_pure's 2.5× breakthrough. Spearman with v26L = 0.99201 — the most diverse experiment since v26h_pure (0.98604). One new scalar feature, +0.00162 Kaggle.
+
+### v26R (0.88653 → 0.88822, +0.00169, current 1st place)
+
+If scalar cosine on the rank-4 SVD carries signal, do *individual axes* carry independent signal that cosine averages out? Grover & Leskovec (KDD 2016) showed in their original node2vec paper that for binary link prediction, the **Hadamard product** (element-wise `u * v`) beats cosine, dot product and L1/L2 combinators on most benchmarks. We test it.
+
+Eleven candidate features across three axes:
+
+```
+Axis 1 — Multi-rank SVD cosine:
+  svd2_cos ... svd12_cos    best: svd3_cos (+0.00003)
+
+Axis 2 — SVD cosine on alternative graphs:
+  svd4_cos on text-weighted, on A^2    both regressed
+
+Axis 3 — Rank-4 Hadamard (element-wise u*v, 4 features):
+  svd4_had0   blend -0.00022
+  svd4_had1   blend -0.00005
+  svd4_had2   blend -0.00004
+  svd4_had3   blend +0.00084    *** WINNER, 13x the next best ***
+  all 4 bundle    blend +0.00074 (cos alone is most of the lift)
+```
+
+Winners after greedy forward selection: `svd3_cos` + `svd4_had3`. Final v26R blend OOF = 0.91359 (+0.00108 over v26Q). HGB and CatBoost both improve by about +0.00106.
+
+The single element `svd4_had3` captures the product on the 4th (smallest-singular-value-weighted) axis of the rank-4 factorization. Counter-intuitive but striking: **the smaller singular directions encode more *specific* structural patterns**, and scalar cosine averages sign agreement across all four dimensions, diluting their individual contribution. Element-wise products expose each axis separately so trees can split on axis 3 directly — a hub-archetype coordinate that v26Q's cosine collapsed.
+
+Results progression:
+```
+v25            0.87208
+v26h_pure      0.88432  (+0.01224)  [consensus breakthrough]
+v26L           0.88491  (+0.00059)  [multi-resolution refinement]
+v26Q           0.88653  (+0.00162)  [SVD role similarity]
+v26R           0.88822  (+0.00169)  [SVD Hadamard axis compound]
+```
+
+v26Q→v26R is a sustained upward trajectory averaging +0.0015 Kaggle per step — comparable pace to the v25→v26b jump but through entirely new information sources. Both jumps (v26Q and v26R) came from a factorization type (low-rank adjacency SVD) that doesn't exist in any of the earlier feature families.
+
+### Attempts to compound further (v26S/T/U/V — all flatlined)
+
+Once v26R landed, five more experiments tried to extend the SVD-Hadamard direction and all failed:
+
+- **v26S** (26 candidates): higher-rank Hadamard (svd6, svd8), Hadamard on A² and text-weighted graphs, element-wise |u-v|. Critical diagnostic: svd4_had3, svd6_had3, and svd8_had3 have *identical* pos/neg gaps — the top-k singular directions are nested across ranks, so rank 6/8 don't give new axes, they reproduce rank 4's first 4 plus weaker extras. Only `svd8_had7` squeaked at +0.00002 (noise). **SVD on the candidate adjacency is saturated at rank 4.**
+- **v26T** (32 candidates): Hadamard + absdiff on the 16-dim Laplacian spectral embedding. The Laplacian eigenvector values are too small (±0.01 range), so element-wise products land in 10^-4 range and get lost in tree-split noise. Only `lap_had10` passed greedy at +0.00010. Scale matters for tree models.
+- **v26U** (14 candidates): NMF (non-negative matrix factorization) at ranks 4 and 8 as a theoretically different decomposition than SVD. Empirically NMF and SVD converge to the same subspace on this binary sparse adjacency — `nmf4_cos` has a strong pos/neg gap of +0.107 (~= `svd4_cos`'s +0.110) but regressed the blend because it's correlated 1:1 with the existing SVD features.
+- **v26V** (7 candidates): consensus SVD via 5% edge-dropout ensembles + per-pair variance features. Mean consensus regressed (rank-4 SVD is robust to small perturbations) but variance features (`var_svd4_cos` and `var_svd4_had3`) have greedy synergy for +0.00059 blend OOF — an unsubmitted candidate representing a new feature type (stability/confidence rather than value).
+
+---
+
 ## Reproducibility
 
 The pipeline is deterministic. Running `experiments_v25.py` twice produced byte-identical `submission_v25.csv` files (max abs diff = 0). The v26 family preserves the same determinism guarantees: Louvain is called through `python-louvain` with an explicit `random_state=42` for both the unweighted and the text-weighted passes, and the Laplacian eigensolver (`scipy.sparse.linalg.eigsh` with `sigma=0` shift-invert) is deterministic.
@@ -175,18 +243,18 @@ To reproduce the current winning submission:
 
 ```bash
 pip install numpy pandas scikit-learn scipy catboost networkx python-louvain
-python experiments_v26L.py
+python experiments_v26R.py
 ```
 
-Outputs `submission_v26L.csv` (the 0.88491 winning entry). Runs in ~3 minutes on a laptop. `experiments_v26L.py` imports helpers from `best_solution.py`, `experiments_v25.py`, `experiments_v26b.py`, `experiments_v26d.py`, `experiments_v26g.py`, and `experiments_v26h.py`, so all seven files must sit in the same directory.
+Outputs `submission_v26R.csv` (the 0.88822 winning entry). Runs in ~3 minutes on a laptop. `experiments_v26R.py` imports helpers from `best_solution.py`, `experiments_v25.py`, `experiments_v26b.py`, `experiments_v26d.py`, `experiments_v26g.py`, `experiments_v26h.py`, `experiments_v26L.py`, and `experiments_v26Q.py`, so all nine files must sit in the same directory.
 
 ## Strategy details
 
-### Final solution — `experiments_v26L.py`
+### Final solution — `experiments_v26R.py`
 
 **Model:** HistGradientBoosting + CatBoost (30 random seeds each), rank-averaged 50/50.
 
-**Features (70 total):**
+**Features (73 total):**
 1. **Graph topology (14):** degree (u, v, |Δ|, sum, log_u, log_v, min, max), common neighbors, Jaccard, Adamic-Adar, resource allocation, Sorensen, preferential attachment, same component, both isolated, hub promoted, hub depressed, paths of length 3 (with leakage correction), Katz approximation
 2. **Text similarity (9):** raw dot/cosine, keyword Jaccard, TF-IDF cosine, TF-IDF L2, asymmetric overlap (u and v), neighborhood TF-IDF (uv, vu, nn — 1-hop GCN-style aggregation with leakage correction)
 3. **Node-level transductive (6):** total/test counts for u and v + product and absolute diff of total counts
@@ -199,7 +267,9 @@ Outputs `submission_v26L.csv` (the 0.88491 winning entry). Runs in ~3 minutes on
 10. **Text-weighted community (v26g, 3):** same_community, community_size_min, community_size_max on a second Louvain pass over the candidate graph, this time with edge weights `1.0 + 3.0 × tfidf_cosine(u, v)` — ARI with the unweighted partition is ≈ 0.063, confirming the two partitions capture structurally different signals
 11. **20-seed Louvain consensus (v26h_pure, 1):** fraction of 20 stochastic Louvain runs at resolution 1.0 on the unweighted candidate graph in which u and v land in the same community. Replaces a noisy single-seed binary with a continuous [0, 1] score that de-noises boundary pairs. The single biggest feature gain of the whole solution (+0.00352 Kaggle).
 12. **Multi-resolution Louvain consensus (v26L, 3):** same 20-seed consensus idea applied at three more Louvain resolutions — 0.7 (~541 micro-clusters), 1.3 (~28 mid-size clusters) and 2.0 (~56 coarse clusters) — each a distinct "soft co-membership" scalar. The extremes (0.7 and 2.0) contribute meaningfully because they see structure the resolution=1.0 partition misses; middle resolutions (1.0, 1.3, 1.6) were dropped or already in the base.
-13. **Self-training:** one conservative round at threshold 0.95 adds ~332 high-confidence test pairs as pseudo-edges, then graph-dependent features are recomputed
+13. **Rank-4 adjacency SVD cosine (v26Q, 1):** factor the unweighted candidate-graph adjacency at rank 4 via truncated SVD and compute the cosine similarity between u and v in the resulting 4-dim role-similarity embedding. Captures "do u and v connect to the same set of other nodes" regardless of whether they're in the same cluster. +0.00162 Kaggle from a single column.
+14. **SVD rank-3 cosine + rank-4 axis-3 Hadamard (v26R, 2):** same factorization but expose specific axes. `svd3_cos` is cosine similarity in a rank-3 SVD (a weaker single-feature cousin of svd4_cos). `svd4_had3` is the element-wise product `emb[u, 3] * emb[v, 3]` — the product on the 4th-most-important singular axis of the rank-4 factorization. Individually `svd4_had3` gave +0.00084 blend OOF (bigger than any single feature since v26h_pure), almost as much as the entire v26Q experiment. Interpretation: smaller singular directions encode more specific structural patterns that scalar cosine averages out, and element-wise products expose those patterns directly to the gradient booster. +0.00169 Kaggle combined.
+15. **Self-training:** one conservative round at threshold 0.95 adds ~332 high-confidence test pairs as pseudo-edges, then graph-dependent features are recomputed
 
 ### v19 baseline — `best_solution.py`
 

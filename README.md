@@ -3,10 +3,10 @@
 # Link Prediction in an Actor Co-occurrence Network
 
 ![Rank](https://img.shields.io/badge/Rank-1st%20Place-FFB800?style=for-the-badge&logo=trophy&logoColor=white)
-![AUC](https://img.shields.io/badge/AUC-0.88491-26D0CE?style=for-the-badge)
+![AUC](https://img.shields.io/badge/AUC-0.88822-26D0CE?style=for-the-badge)
 ![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=for-the-badge&logo=python&logoColor=white)
 
-**Predicting missing edges in a sparse actor co-occurrence graph using hand-crafted features and gradient boosting. Best Kaggle public AUC: 0.88491 (1st place).**
+**Predicting missing edges in a sparse actor co-occurrence graph using hand-crafted features and gradient boosting. Best Kaggle public AUC: 0.88822 (1st place).**
 
 </div>
 
@@ -22,11 +22,11 @@ The catch: the graph is extremely sparse (mean degree ~2.9) and **91.5% of test 
 
 ```mermaid
 flowchart LR
-    A[Raw Data] --> B[Feature Engineering<br/>70 scalar features]
+    A[Raw Data] --> B[Feature Engineering<br/>73 scalar features]
     B --> C[Self-Training<br/>+332 pseudo-edges]
-    C --> D[Louvain + Text-weighted Louvain<br/>+ 100-run Multi-resolution Consensus]
+    C --> D[Louvain Consensus<br/>+ Low-rank Adjacency SVD]
     D --> E[HGB + CatBoost<br/>30 seeds, rank blend]
-    E --> F[0.88491 AUC<br/>🥇 1st place]
+    E --> F[0.88822 AUC<br/>🥇 1st place]
 
     style A fill:#1A2980,color:#fff,stroke:none
     style B fill:#7C5CFC,color:#fff,stroke:none
@@ -36,11 +36,11 @@ flowchart LR
     style F fill:#FFB800,color:#fff,stroke:none
 ```
 
-The core insight behind our approach: **with only 10K training samples, scalar hand-crafted features massively outperform learned representations**. Every embedding-based method we tried (SVD, Node2Vec, GCN, TabPFN, SEAL) overfit, flattened out, or added nothing to the blend. Instead, we engineered 70 carefully chosen scalar features, each targeting a different aspect of what makes two actors likely to co-occur. The five biggest jumps all came from fundamentally new information sources: pair-level transductive features (v24/v25, 0.867→0.872), global community structure on a label-free candidate graph (v26b/d, 0.872→0.8805), a second Louvain partition on a *text-weighted* variant of the same graph (v26g, 0.8805→0.88080), **consensus across 20 Louvain seeds** to denoise single-seed noise (v26h_pure, 0.88080→0.88432), and **multi-resolution consensus** at 5 different Louvain resolutions (v26L, 0.88432→0.88491).
+The core insight behind our approach: **with only 10K training samples, scalar hand-crafted features massively outperform learned representations**. Every embedding-based method we tried at high dimension (Node2Vec, GCN, TabPFN, SEAL) overfit or flatlined. Instead, we engineered 73 carefully chosen scalar features, each targeting a different aspect of what makes two actors likely to co-occur. The six biggest jumps all came from fundamentally new information sources: pair-level transductive features (v24/v25, 0.867→0.872), global community structure on a label-free candidate graph (v26b/d, 0.872→0.8805), a second Louvain partition on a *text-weighted* variant of the same graph (v26g, 0.8805→0.88080), **consensus across 20 Louvain seeds** to denoise single-seed noise (v26h_pure, 0.88080→0.88432), **multi-resolution consensus** at 5 different Louvain resolutions (v26L, 0.88432→0.88491), **low-rank adjacency SVD cosine** as role-similarity features (v26Q, 0.88491→0.88653), and **SVD Hadamard products** exposing specific role axes element-wise (v26R, 0.88653→0.88822).
 
-### 1. Feature Engineering (70 features)
+### 1. Feature Engineering (73 features)
 
-We build features that answer eight distinct questions about each node pair:
+We build features that answer ten distinct questions about each node pair:
 
 | | Family | # | Question it answers |
 |---|---|---|---|
@@ -56,6 +56,8 @@ We build features that answer eight distinct questions about each node pair:
 | **Text community (v26g)** | Text-weighted Louvain | 3 | _Are u and v in the same text-aware cluster?_ |
 | **Consensus community (v26h_pure)** | 20-seed Louvain consensus | 1 | _What fraction of stochastic Louvain runs put them in the same cluster?_ |
 | **Multi-res consensus (v26L)** | 20-seed × 3-resolution consensus | 3 | _Are they co-clustered at micro, medium and coarse scales?_ |
+| **SVD role similarity (v26Q)** | Rank-4 adjacency SVD cosine | 1 | _Do u and v connect to the same set of other nodes?_ |
+| **SVD Hadamard axis (v26R)** | Rank-3 SVD cosine + rank-4 SVD axis-3 Hadamard | 2 | _On a specific role-similarity axis, do u and v align?_ |
 
 **Graph topology** — We compute classical link prediction indices from the literature: Common Neighbors, Jaccard, Adamic-Adar, Resource Allocation, Sorensen, and Preferential Attachment. We also extract degree features (raw, sum, difference, log-transformed, min/max) and component membership flags. For pairs with CN=0 (the vast majority), we go beyond direct neighbors with **paths of length 3** ($A^3[u,v]$ via sparse matrix multiplication), which captures indirect connectivity that CN misses entirely.
 
@@ -97,7 +99,11 @@ These features are **leakage-free** (no labels used) but reveal a form of higher
 
 **Consensus across 20 Louvain seeds (v26h_pure — +0.00352 Kaggle, the biggest single jump since v12).** Crucial observation from earlier experiments: the ARI between two single-seed Louvain runs on this graph is only ≈ 0.20 — each run produces a structurally different partition because Louvain is a greedy algorithm whose node ordering is randomized. That means every feature derived from a single-seed partition (`same_community`, `comm_cn`, `community_size_*`) was extremely noisy for pairs sitting on community boundaries, which is the majority of hard cases. We fix this by running Louvain at 20 different seeds and computing the **fraction of seeds in which u and v land in the same community** — a continuous [0, 1] consensus score that replaces the noisy binary flag. Pairs robustly co-clustered (18/20 runs together) get a clean ≈ 1.0, pairs robustly apart get ≈ 0.0, boundary pairs get something in between and the booster can split on the exact threshold. The per-pair mean pos/neg gap barely changes (+0.094 vs the single-seed +0.100), but the *within-class variance collapses* — which is what a gradient booster actually cares about. One new scalar, +0.00352 Kaggle.
 
-**Multi-resolution consensus Louvain (v26L — +0.00059 Kaggle, current best).** After v26h_pure worked, the natural question: if consensus across 20 *seeds* helps at resolution 1.0, does consensus across 20 seeds at *other resolutions* add orthogonal signal? We run 100 Louvain partitions total — 20 seeds × 5 resolutions {0.7, 1.0, 1.3, 1.6, 2.0} — giving 5 independent consensus fractions per pair. The ablation (per-resolution delta on the HGB+CatBoost blend OOF) is bimodal in a way we didn't anticipate: **the extremes help, the middle doesn't**. Resolution 0.7 (≈541 micro-clusters of 6-7 nodes each) captures a tight intra-cluster signal the coarse partition misses. Resolution 2.0 (≈56 medium-coarse clusters of ~64 nodes each) captures broader neighborhoods. Resolution 1.0 is redundant with v26h_pure's existing consensus. Resolution 1.3 and 1.6 are too close to 1.0 to add much. We keep only the three winning resolutions (0.7, 1.3, 2.0) — 3 new scalars, +0.00059 Kaggle, new 1st place at 0.88491.
+**Multi-resolution consensus Louvain (v26L — +0.00059 Kaggle).** After v26h_pure worked, the natural question: if consensus across 20 *seeds* helps at resolution 1.0, does consensus across 20 seeds at *other resolutions* add orthogonal signal? We run 100 Louvain partitions total — 20 seeds × 5 resolutions {0.7, 1.0, 1.3, 1.6, 2.0} — giving 5 independent consensus fractions per pair. The ablation (per-resolution delta on the HGB+CatBoost blend OOF) is bimodal in a way we didn't anticipate: **the extremes help, the middle doesn't**. Resolution 0.7 (≈541 micro-clusters of 6-7 nodes each) captures a tight intra-cluster signal the coarse partition misses. Resolution 2.0 (≈56 medium-coarse clusters of ~64 nodes each) captures broader neighborhoods. Resolution 1.0 is redundant with v26h_pure's existing consensus. Resolutions 1.3 and 1.6 are too close to 1.0 to add much. We keep only the three winning resolutions (0.7, 1.3, 2.0) — 3 new scalars, +0.00059 Kaggle, 1st place at 0.88491.
+
+**Low-rank adjacency SVD cosine (v26Q — +0.00162 Kaggle).** A new information source that v26L's Louvain-based features literally cannot see. The Louvain community features ask *"are u and v in the same cluster?"*, and the Laplacian spectral features ask *"are u and v close in the soft-clustering geometry?"*. The truncated SVD of the candidate-graph adjacency asks a mathematically different question: *"do u and v connect to the same set of other nodes, regardless of whether they're in the same cluster?"*. This is role similarity rather than cluster co-membership — two actors can be in different Louvain clusters but still look structurally identical (connecting to the same bridging hubs) and SVD will find them. We factor the candidate adjacency at rank 4 and feed the HGB+CatBoost model the cosine similarity between u and v in this 4-dim SVD space. Rank 4 is the sweet spot: lower is too coarse, rank 8 overfits. Cosine beats dot product and L2 because it isolates the directional (role-similarity) signal. One new scalar, +0.00094 blend OOF, **+0.00162 Kaggle** (a 1.72× ratio — in the "real orthogonal signal" zone, on par with v26h_pure's breakthrough).
+
+**SVD Hadamard products (v26R — +0.00169 Kaggle, current 1st place).** If scalar cosine on the rank-4 SVD carries signal, do *individual axes* carry independent signal that cosine averages out? The answer is a strong yes: running a 7-candidate ablation across SVD cosine at other ranks, SVD on alternative graphs, and the rank-4 Hadamard product (element-wise `u * v`), the single biggest winner was `svd4_had3` — the element-wise product on the 4th (smallest-singular-value-weighted) axis of the rank-4 factorization. Individually this feature gave +0.00084 blend OOF, almost as much as v26Q's entire cosine feature, and in combination with a weaker `svd3_cos` feature the v26R base delivered +0.00108 blend OOF over v26Q. The interpretation: the smaller singular directions within a low-rank factorization encode the most *specific* structural patterns, and scalar cosine averages sign agreement across all dimensions, diluting their contribution. Element-wise products let the tree isolate axis 3 directly — a hub-archetype coordinate that v26Q's cosine collapsed. This is node2vec-style operator selection (Grover & Leskovec 2016) applied to hand-crafted SVD embeddings. Two new scalars, **+0.00169 Kaggle**, 1st place at 0.88822.
 
 ### 2. Self-Training Graph Augmentation
 
@@ -132,7 +138,9 @@ Final predictions combine **HistGradientBoosting** and **CatBoost** (30 random s
 | + Community common neighbors (v26d) | 63 | 0.88050 |
 | + Text-weighted Louvain community (v26g) | 66 | 0.88080 |
 | + 20-seed Louvain consensus (v26h_pure) | 67 | 0.88432 |
-| **+ Multi-resolution consensus Louvain (v26L)** | **70** | **0.88491** 🥇 |
+| + Multi-resolution consensus Louvain (v26L) | 70 | 0.88491 |
+| + Rank-4 adjacency SVD cosine (v26Q) | 71 | 0.88653 |
+| **+ SVD Hadamard axis-3 product (v26R)** | **73** | **0.88822** 🥇 |
 
 > Every embedding-based method made things worse. On small datasets, feature discipline beats model complexity.
 
@@ -219,6 +227,14 @@ Three new scalar features, +0.00089 OOF (HGB +0.00088 and CatBoost +0.00088 — 
 | v26i: v26h_pure + canonical Lancichinetti partition + cons sizes | 0.88389 | +0.00061 blend OOF but HGB gained while Cat regressed; Kaggle net -0.00043 |
 | v26j: classical LP heuristics (CN/AA/RA/Katz...) on candidate graph | untested | All 7 features regressed blend OOF; fully subsumed by v26h_pure consensus |
 | v26k: candidate-graph neighbor TF-IDF features | untested | Pos/neg gap was *inverted* on two of three features; all regressed the blend |
+| v26M: multi-res consensus on text-weighted + test-partner-weighted graphs | untested | All 6 regressed; weighting collapses the resolution diversity v26L exploits |
+| v26N: extreme Louvain resolutions {0.3, 0.5, 3.0, 4.0} on unweighted graph | untested | All 4 regressed; resolutions 3.0 and 4.0 have *inverted* pos/neg gaps |
+| v26O: adversarial validation feature pruning | untested | adv AUC 0.99986, but dropping top-shifted features all regressed |
+| v26P: multi-round self-training with v26L as base | 0.88389-ish | Round 2 regressed at both 0.97 and 0.95 thresholds (52-124 new pseudo-edges) |
+| v26S: high-rank SVD Hadamard + A² + text-weighted SVD + abs diff (26 cands) | untested | Only svd8_had7 squeaked at +0.00002 noise; SVD saturated at rank 4 |
+| v26T: Hadamard + abs diff on 16-dim Laplacian spectral (32 cands) | untested | Laplacian values too small (10^-4 element-wise products), lost in noise |
+| v26U: NMF factorization at ranks 4 and 8 | untested | Gives the same subspace as SVD on binary sparse adjacency; all regressed |
+| v26V: consensus SVD via 5% edge dropout + variance features | untested | Mean consensus regressed (SVD robust to dropout); variance pair synergy +0.00059 blend OOF candidate |
 | TabPFN on v25 features, rank blend with v25 | OOF +0.00002 | TabPFN lacked community signal, almost perfectly correlated with v25 |
 | TabPFN on v26d features, rank blend with v26d | OOF +0.00004 | Even with community features the models converged (Spearman 0.983) |
 | SEAL GNN (radius-1 subgraphs + GraphSAGE) on Colab A100 | OOF 0.7011 | Local subgraph GNN can't see transductive pair-level features; ceiling was 0.75-0.80 standalone |
@@ -226,7 +242,9 @@ Three new scalar features, +0.00089 OOF (HGB +0.00088 and CatBoost +0.00088 — 
 ## Repo Structure
 
 ```
-├── experiments_v26L.py       # 🥇 BEST solution (v26h_pure + multi-res consensus, 0.88491)
+├── experiments_v26R.py       # 🥇 BEST solution (v26Q + svd3_cos + svd4_had3, 0.88822)
+├── experiments_v26Q.py       # v26L + svd4_cos (0.88653)
+├── experiments_v26L.py       # v26h_pure + multi-res consensus (0.88491)
 ├── experiments_v26h_pure.py  # 20-seed Louvain consensus (0.88432)
 ├── experiments_v26g.py       # v26d + text-weighted Louvain (0.88080)
 ├── experiments_v26d.py       # v26b + comm_cn (0.88050)
@@ -245,6 +263,14 @@ Three new scalar features, +0.00089 OOF (HGB +0.00088 and CatBoost +0.00088 — 
 ├── experiments_v26i_canonical.py # Clean canonical-only variant (not submitted)
 ├── experiments_v26j.py       # Candidate-graph LP heuristics (all regressed)
 ├── experiments_v26k.py       # Candidate-graph neighbor text (all regressed)
+├── experiments_v26M.py       # Consensus on weighted candidate graphs (all regressed)
+├── experiments_v26N.py       # Extreme Louvain resolutions {0.3, 0.5, 3.0, 4.0} (all regressed)
+├── experiments_v26O.py       # Adversarial validation feature pruning (nothing droppable)
+├── experiments_v26P.py       # Multi-round self-training with v26L (regressed)
+├── experiments_v26S.py       # Broad Hadamard sweep — 26 candidates (SVD saturated at rank 4)
+├── experiments_v26T.py       # Hadamard + absdiff on Laplacian spectral (scale too small)
+├── experiments_v26U.py       # NMF rank 4 and 8 (duplicates SVD on binary adjacency)
+├── experiments_v26V.py       # Consensus SVD via edge dropout + variance features
 ├── experiments_v27.py        # TabPFN on v25 blend with v25 (no-op)
 ├── experiments_v28.py        # TabPFN on v26d blend with v26d (no-op)
 ├── logistic_regression.py    # Baseline: LR with 16 features
@@ -261,10 +287,10 @@ Three new scalar features, +0.00089 OOF (HGB +0.00088 and CatBoost +0.00088 — 
 
 ```bash
 pip install numpy pandas scikit-learn scipy catboost networkx python-louvain
-python experiments_v26L.py
+python experiments_v26R.py
 ```
 
-`experiments_v26L.py` is the only script you need to run to obtain the current winning submission. It rebuilds everything from scratch (graph, features, self-training, Louvain at 5 resolutions × 20 seeds = 100 partitions, training, blend) and outputs `submission_v26L.csv` — the 0.88491 entry. Runs in ~3 minutes on a laptop. The v26L script imports a few helpers from `experiments_v25.py`, `experiments_v26b.py`, `experiments_v26d.py`, `experiments_v26g.py`, and `experiments_v26h.py`, so all six files need to sit in the same directory.
+`experiments_v26R.py` is the only script you need to run to obtain the current winning submission. It rebuilds everything from scratch (graph, features, self-training, Louvain consensus, low-rank SVD of the candidate adjacency, final HGB+CatBoost blend) and outputs `submission_v26R.csv` — the 0.88822 entry. Runs in ~3 minutes on a laptop. The v26R script imports helpers from `experiments_v25.py`, `experiments_v26b.py`, `experiments_v26d.py`, `experiments_v26g.py`, `experiments_v26h.py`, `experiments_v26L.py`, and `experiments_v26Q.py`, so all eight files need to sit in the same directory.
 
 ### Reproducibility guarantees
 
