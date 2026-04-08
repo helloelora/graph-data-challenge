@@ -1,16 +1,15 @@
 # Link Prediction — Results Summary
 
-🥇 **Final Kaggle public AUC: 0.87091 (1st place)** with `submission_v24.csv`
+🥇 **Best Kaggle public AUC: 0.87208 (1st place)** with `submission_v25.csv`
 
-## Final leaderboard (top 5)
+## Current leaderboard (top 4)
 
 | # | Team | Score |
 |---|---|---|
-| **1** | **GraphTheWorld (us)** | **0.87091** |
-| 2 | SOTAlmost | 0.86925 |
+| **1** | **GraphTheWorld (us)** | **0.87208** |
+| 2 | SOTAlmost | 0.87040 |
 | 3 | LavaXMaster | 0.86820 |
 | 4 | ninjjacat | 0.86769 |
-| 5 | Adam Y | 0.85590 |
 
 ## Full progression of submissions
 
@@ -32,47 +31,78 @@
 | HGB v22 (v19 + pseudo-labeling) | `experiments_v22.py` | `submission_v22_safe.csv` | — | 0.86674 |
 | HGB v23 (v19 + symmetric TTA blend) | `experiments_v23.py` | `submission_v23_tta_v19_blend.csv` | — | 0.86741 |
 | HGB v24 (v19 + 7 pair-transductive) blend 70/30 | `experiments_v24.py` | `submission_v24_blend_70v19.csv` | 0.90319 | 0.86948 |
-| **HGB v24 pure (48 features, HGB+CatBoost rank blend)** 🥇 | `experiments_v24.py` | `submission_v24.csv` | 0.90319 | **0.87091** |
+| HGB v24 pure (48 features, HGB+CatBoost rank blend) | `experiments_v24.py` | `submission_v24.csv` | 0.90319 | 0.87091 |
+| **HGB v25 pure (56 features, HGB+CatBoost rank blend)** 🥇 | `experiments_v25.py` | `submission_v25.csv` | 0.90357 | **0.87208** |
 
 > OOF AUCs are inflated by the leaky transductive features (computed once on train+test). Kaggle score is the public leaderboard AUC.
 
 ---
 
-## The winning idea: pair-level transductive features (v24)
+## The winning idea: pair-level transductive features (v24 then v25)
 
 After v19 plateaued at 0.86766, six controlled experiments (more seeds, +LightGBM, dual self-training, pseudo-labeling, feature bagging, hyperparam variants, train/test symmetric augmentation) all scored 0.001-0.0014 *below* v19. v19 was at a tight local optimum.
 
-**The breakthrough** came from adding a fundamentally new family of features rather than perturbing the existing pipeline. v19's biggest single gain (+0.011 AUC) had come from *node-level* transductive counts — how many times each node appears across train and test pairs. v24 pushes this idea one order higher: instead of looking at how often each node appears, we look at which **other nodes are shared partners across the test set**.
+**The breakthrough** came from adding a fundamentally new family of features rather than perturbing the existing pipeline. v19's biggest single gain (+0.011 AUC) had come from *node-level* transductive counts — how many times each node appears across train and test pairs. v24 pushes this idea one order higher: instead of looking at how often each node appears, we look at which **other nodes are shared partners across the test set**. v25 then pushes the same direction even further with second-order features (transductive triangles, Adamic-Adar in test partner space).
 
-For each pair $(u, v)$:
+*v24 features (7) — for each pair $(u, v)$:*
 - $\text{test\_partners}(u)$ = set of nodes that appear in some test pair with $u$
 - `shared_test_partners` = $|\text{test\_partners}(u) \cap \text{test\_partners}(v)|$
 - Same for train partners and combined train+test partners
 - Jaccard variants of these intersections
 - min/max of test-partner-set sizes for each side
 
-**Why it works:** if two actors share many test partners, they likely belong to the same cluster in the original graph and the edge between them was probably one of those that got randomly deleted. The signal is leakage-free (no labels used), sparse but strongly directional: positive training pairs have on average **12× more shared test partners** than negative pairs.
+*v25 features (8) — same idea, higher order:*
+- `test_triangles` = $|\{w : (u,w) \in \text{test} \land (w,v) \in \text{test}\}|$ — paths of length 2 through the test set
+- `train_triangles`, `mixed_triangles` = same for train pairs and mixed train/test
+- `shared_test_aa` = Adamic-Adar style: $\sum_w 1/\log(\text{test\_count}(w))$ over shared test partners
+- `shared_test_ra` = resource-allocation variant
+- `shared_total_pa` = $|\text{test\_partners}(u)| \cdot |\text{test\_partners}(v)|$ — preferential attachment in test space
+- `exclusive_test_u`, `exclusive_test_v` = asymmetric set-difference sizes
 
-**Results:**
+**Why it works:** if two actors share many test partners (or many transductive triangles), they likely belong to the same cluster in the original graph and the edge between them was probably one of those that got randomly deleted. The signal is leakage-free (no labels used), sparse but strongly directional: positive training pairs have on average **12× more shared test partners** (v24) and **23× more test triangles** (v25) than negative pairs.
+
+**Results progression:**
 - v19 (41 features): 0.86766
-- v24 (48 features) blended 70/30 with v19: 0.86948 (+0.00182, took us to #1)
-- **v24 (48 features) pure: 0.87091 (+0.00325 over v19)** 🥇
+- v24 (48 features) pure: 0.87091 (+0.00325 over v19)
+- **v25 (56 features) pure: 0.87208 (+0.00117 over v24)** 🥇
+
+The marginal Kaggle gain (v24→v25) is smaller than the first jump (v19→v24), as expected — v25 mines deeper in the same vein that v24 opened up. Each later submission in the v25 family confirmed that pure v25 is the best, outperforming any blend with earlier versions.
 
 ---
 
+## Reproducibility
+
+The pipeline is fully deterministic. We verified bit-exact reproducibility by running `experiments_v25.py` twice — both `submission_v25.csv` files were byte-identical (max abs diff = 0, Spearman correlation = 1.0).
+
+What guarantees this:
+- All model `random_state` are explicitly set (`SEED = 42` for HGB, CatBoost, plus `np.random.seed`)
+- Seed offsets in the 30-seed ensembles are deterministic (`SEED + s * 31`)
+- Sets used in feature computation contain only integers; Python only randomizes string hashes, so set iteration order is stable
+- No GPU, no multi-threaded RNG, no external network calls
+
+To reproduce on your machine:
+
+```bash
+pip install numpy pandas scikit-learn scipy catboost lightgbm
+python experiments_v25.py
+```
+
+Outputs `submission_v25.csv` (the 0.87208 winning entry) plus several blend variants. Runs in ~3.5 minutes on a laptop.
+
 ## Strategy details
 
-### Final solution — `experiments_v24.py`
+### Final solution — `experiments_v25.py`
 
 **Model:** HistGradientBoosting + CatBoost (30 random seeds each), rank-averaged 50/50.
 
-**Features (48 total):**
+**Features (56 total):**
 1. **Graph topology (14):** degree (u, v, |Δ|, sum, log_u, log_v, min, max), common neighbors, Jaccard, Adamic-Adar, resource allocation, Sorensen, preferential attachment, same component, both isolated, hub promoted, hub depressed, paths of length 3 (with leakage correction), Katz approximation
 2. **Text similarity (9):** raw dot/cosine, keyword Jaccard, TF-IDF cosine, TF-IDF L2, asymmetric overlap (u and v), neighborhood TF-IDF (uv, vu, nn — 1-hop GCN-style aggregation with leakage correction)
 3. **Node-level transductive (6):** total/test counts for u and v + product and absolute diff of total counts
-4. **Pair-level transductive (7) — v24's contribution:** shared test partners, shared train partners, shared total partners, Jaccard of test partners, Jaccard of all partners, min/max of test partner set size
-5. **Feature interactions (5):** common neighbors × TF-IDF cosine, CN × cosine, PA × cosine, same_comp × TF-IDF, paths3 × TF-IDF
-6. **Self-training:** one conservative round at threshold 0.95 adds ~305 high-confidence test pairs as pseudo-edges, then graph-dependent features are recomputed
+4. **Pair-level transductive — v24 (7):** shared test partners, shared train partners, shared total partners, Jaccard of test partners, Jaccard of all partners, min/max of test partner set size
+5. **Pair-level transductive — v25 (8):** test/train/mixed triangles, Adamic-Adar and resource-allocation in test partner space, preferential attachment in test space, exclusive test partners (u and v)
+6. **Feature interactions (5):** common neighbors × TF-IDF cosine, CN × cosine, PA × cosine, same_comp × TF-IDF, paths3 × TF-IDF
+7. **Self-training:** one conservative round at threshold 0.95 adds ~305 high-confidence test pairs as pseudo-edges, then graph-dependent features are recomputed
 
 ### v19 baseline — `best_solution.py`
 
