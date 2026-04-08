@@ -2,4 +2,4 @@ __pycache__/
 *.pyc
 *.zip
 submission_*.csv
-.claude/
+catboost_info/

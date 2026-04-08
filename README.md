@@ -3,10 +3,10 @@
 # Link Prediction in an Actor Co-occurrence Network
 
 ![Rank](https://img.shields.io/badge/Rank-1st%20Place-FFB800?style=for-the-badge&logo=trophy&logoColor=white)
-![AUC](https://img.shields.io/badge/AUC-0.867-26D0CE?style=for-the-badge)
+![AUC](https://img.shields.io/badge/AUC-0.871-26D0CE?style=for-the-badge)
 ![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=for-the-badge&logo=python&logoColor=white)
 
-**Predicting missing edges in a sparse actor co-occurrence graph using hand-crafted features and gradient boosting.**
+**Predicting missing edges in a sparse actor co-occurrence graph using hand-crafted features and gradient boosting. Final Kaggle public AUC: 0.87091 (1st place).**
 
 </div>
 
@@ -22,10 +22,10 @@ The catch: the graph is extremely sparse (mean degree ~2.9) and **91.5% of test 
 
 ```mermaid
 flowchart LR
-    A[Raw Data] --> B[Feature Engineering]
-    B --> C[Self-Training]
-    C --> D[Ensemble]
-    D --> E[0.867 AUC]
+    A[Raw Data] --> B[Feature Engineering<br/>48 scalar features]
+    B --> C[Self-Training<br/>+305 pseudo-edges]
+    C --> D[HGB + CatBoost<br/>30 seeds, rank blend]
+    D --> E[0.871 AUC<br/>🥇 1st place]
 
     style A fill:#1A2980,color:#fff,stroke:none
     style B fill:#7C5CFC,color:#fff,stroke:none
@@ -34,19 +34,20 @@ flowchart LR
     style E fill:#FFB800,color:#fff,stroke:none
 ```
 
-The core insight behind our approach: **with only 10K training samples, scalar hand-crafted features massively outperform learned representations**. Every embedding-based method we tried (SVD, Node2Vec, GCN) overfit and hurt performance. Instead, we engineered 36 carefully chosen scalar features across three complementary families, each targeting a different aspect of what makes two actors likely to co-occur.
+The core insight behind our approach: **with only 10K training samples, scalar hand-crafted features massively outperform learned representations**. Every embedding-based method we tried (SVD, Node2Vec, GCN) overfit and hurt performance. Instead, we engineered 48 carefully chosen scalar features, each targeting a different aspect of what makes two actors likely to co-occur — culminating in **pair-level transductive features** (v24) that delivered the final breakthrough from 0.867 to 0.871.
 
-### 1. Feature Engineering (36 features)
+### 1. Feature Engineering (48 features)
 
-We build features that answer three distinct questions about each node pair:
+We build features that answer four distinct questions about each node pair:
 
 | | Family | # | Question it answers |
 |---|---|---|---|
 | **Graph** | Topology | 14 | _Are these nodes close in the graph?_ |
 | **Text** | Similarity | 9 | _Do these actors share similar keywords?_ |
-| **Transductive** | Meta-signals | 6 | _Does the test set structure hint at a link?_ |
+| **Node transductive** | Meta-signals | 6 | _How often do u and v appear in train/test pairs?_ |
+| **Pair transductive (v24)** | Test-set structure | 7 | _Do u and v share other test partners?_ |
 | **Hybrid** | Neighborhood text | 4 | _Does this actor look like the other's friends?_ |
-| **Derived** | Katz, hubs, interactions | 3 | _What do higher-order paths tell us?_ |
+| **Derived** | Katz, hubs, interactions | 8 | _What do higher-order paths and feature interactions tell us?_ |
 
 **Graph topology** — We compute classical link prediction indices from the literature: Common Neighbors, Jaccard, Adamic-Adar, Resource Allocation, Sorensen, and Preferential Attachment. We also extract degree features (raw, sum, difference, log-transformed, min/max) and component membership flags. For pairs with CN=0 (the vast majority), we go beyond direct neighbors with **paths of length 3** ($A^3[u,v]$ via sparse matrix multiplication), which captures indirect connectivity that CN misses entirely.
 
@@ -56,7 +57,17 @@ We build features that answer three distinct questions about each node pair:
 
 **Neighborhood text** — For each node, we average its neighbors' TF-IDF vectors, then ask: _"Does node $v$'s text profile match what node $u$'s friends look like?"_ This is essentially a manual 1-hop GCN aggregation expressed as scalar features — capturing the same signal without the overfitting risk of learned embeddings. We also correct for leakage on positive training pairs by excluding $v$'s contribution from $u$'s neighborhood average.
 
-**Transductive features** — The biggest single improvement (+0.011 AUC). We count how many times each node appears across all pairs (train + test). Nodes appearing frequently in the test set likely had more edges deleted. We separate train-only and test-only counts and add interaction terms for richer signal.
+**Node-level transductive features** — Big single improvement (+0.011 AUC). We count how many times each node appears across all pairs (train + test). Nodes appearing frequently in the test set likely had more edges deleted. We separate train-only and test-only counts and add interaction terms for richer signal.
+
+**Pair-level transductive features (v24 — the final +0.003 AUC)** — Pushing the transductive insight one order higher: instead of counting node appearances, we look at *shared partners across the test set*. For each pair $(u, v)$:
+
+- $\text{test\_partners}(u)$ = set of nodes that appear in some test pair with $u$
+- $|\text{test\_partners}(u) \cap \text{test\_partners}(v)|$ — how many other nodes are "test partners" of both $u$ and $v$
+- Same for train partners and combined train+test partners
+- Jaccard variants of these intersections
+- min/max of $|\text{test\_partners}|$ on each side
+
+These features are **leakage-free** (no labels used) but reveal a form of higher-order structure that v19's node-level counts cannot capture: if two actors share many test partners, they likely belong to the same cluster in the original graph and the edge between them was probably one of those that got deleted. On training data this signal is sparse but strongly directional: positive pairs have on average **12× more shared test partners** than negative pairs.
 
 ### 2. Self-Training Graph Augmentation
 
@@ -70,11 +81,11 @@ This single conservative round improved downstream features (CN, paths3, neighbo
 
 ### 3. Ensemble & Seed Averaging
 
-Final predictions combine **HistGradientBoosting** and **CatBoost** (15 random seeds each) via **rank averaging**. Since AUC is rank-based, converting each model's predictions to ranks before blending eliminates calibration mismatches. The two boosting algorithms make different errors, and their combination is more stable than either alone.
+Final predictions combine **HistGradientBoosting** and **CatBoost** (30 random seeds each) via **rank averaging**. Since AUC is rank-based, converting each model's predictions to ranks before blending eliminates calibration mismatches. The two boosting algorithms make different errors, and their combination is more stable than either alone.
 
 ## Results
 
-| Approach | Features | AUC |
+| Approach | Features | Public AUC |
 |---|---|---|
 | GCN (end-to-end) | adjacency + keywords | 0.670 |
 | Node2Vec embeddings | 87 | 0.770 |
@@ -82,10 +93,18 @@ Final predictions combine **HistGradientBoosting** and **CatBoost** (15 random s
 | Graph heuristics only | 14 | 0.831 |
 | + Text similarity | 23 | 0.850 |
 | + Self-training | 23 | 0.851 |
-| + Transductive counts | 27 | 0.861 |
-| **+ Paths3, Neighborhood text** | **36** | **0.867** |
+| + Node transductive counts | 27 | 0.861 |
+| + Paths3, Neighborhood text (v19) | 36 | 0.867 |
+| + Feature interactions (v19) | 41 | 0.86766 |
+| **+ Pair-level transductive (v24)** | **48** | **0.87091** 🥇 |
 
 > Every embedding-based method made things worse. On small datasets, feature discipline beats model complexity.
+
+### The v24 breakthrough
+
+After v19 (0.867) we ran six controlled experiments (more seeds, LightGBM in the blend, dual self-training, pseudo-labeling, feature bagging, hyperparam variations, train/test symmetric augmentation). Every single one scored *below* v19 by 0.001-0.0014 on Kaggle. v19 was at a tight local optimum.
+
+The breakthrough only came when we added a fundamentally new family of features — **pair-level transductive signals** — rather than perturbing the existing pipeline. The lesson: when local search has plateaued, look for an orthogonal source of information rather than reshuffling what you already have.
 
 ## What Didn't Work
 
@@ -97,29 +116,42 @@ Final predictions combine **HistGradientBoosting** and **CatBoost** (15 random s
 | Multi-round self-training | < 0.867 | Lower thresholds add noisy edges |
 | Personalized PageRank | ~1.0 OOF | Leakage too complex to correct analytically |
 | Stacking meta-learner | < 0.861 | Further overfits the small dataset |
+| More seeds (30 → 50) | 0.86655 | Marginal noise; we're already at the variance floor |
+| +LightGBM in blend | 0.86629 | LGB errors are not better, just different |
+| Dual self-training (0.95 + 0.97) | 0.86660 | Slightly noisier graph than single round |
+| Pseudo-labeling test → training rows | 0.86674 | Confirmation bias outweighs added data |
+| Feature bagging across subsets | 0.86341 | Subsets too narrow, lose signal |
+| Symmetric (u,v)↔(v,u) augmentation | 0.86741 | Order signal in v19 features is not spurious |
+| Hyperparam micro-variations | 0.86672 | v19 hyperparams are already near-optimal |
 
 ## Repo Structure
 
 ```
-├── best_solution.py          # Final solution (v19 — 36 features + ensemble)
+├── experiments_v24.py        # 🥇 WINNING solution (v19 features + pair transductive)
+├── best_solution.py          # v19 baseline (41 features, 0.86766)
+├── experiments_v21.py        # Controlled experiments (more seeds, +LGB, dual self-train)
+├── experiments_v22.py        # Pseudo-labeling, feature bagging, hyperparam variants
+├── experiments_v23.py        # Symmetric augmentation (TTA + train doubled)
 ├── logistic_regression.py    # Baseline: LR with 16 features
 ├── hist_gradient_boosting.py # HGB baseline
-├── xgb_hgb_lr_ensemble.py   # Early ensemble experiment
+├── xgb_hgb_lr_ensemble.py    # Early ensemble experiment
 ├── train.txt                 # 10,496 labeled pairs (50% positive)
 ├── test.txt                  # 3,498 test pairs
 ├── node_information.csv      # 3,597 nodes x 932 keyword features
 ├── report.tex                # 3-page LaTeX report
-└── submission_v16b_blend.csv # Best submission (0.867)
+├── RESULTS.md                # Full progression of every submission
+└── submission_v24.csv        # 🥇 Winning submission (0.87091)
 ```
 
 ## Reproduce
 
 ```bash
-pip install numpy pandas scikit-learn scipy catboost
-python best_solution.py
+pip install numpy pandas scikit-learn scipy catboost lightgbm
+python best_solution.py        # generates v19 baseline submissions
+python experiments_v24.py      # generates v24 submissions including the winner
 ```
 
-Generates submission CSVs ready for Kaggle upload. Runs in ~40 seconds on a laptop.
+`experiments_v24.py` produces `submission_v24.csv` (the 0.87091 winning submission) along with several blend variants. Runs in ~2 minutes on a laptop.
 
 ## Key References
 
