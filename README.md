@@ -20,21 +20,19 @@ The catch: the graph is extremely sparse (mean degree ~2.9) and **91.5% of test 
 
 ## Strategy Overview
 
-```mermaid
-flowchart LR
-    A[Raw Data] --> B[Feature Engineering<br/>73 scalar features]
-    B --> C[Self-Training<br/>+332 pseudo-edges]
-    C --> D[Louvain Consensus<br/>+ Low-rank Adjacency SVD]
-    D --> E[HGB + CatBoost<br/>30 seeds, rank blend]
-    E --> F[0.88822 AUC<br/>🥇 1st place]
-
-    style A fill:#1A2980,color:#fff,stroke:none
-    style B fill:#7C5CFC,color:#fff,stroke:none
-    style C fill:#FF922B,color:#fff,stroke:none
-    style D fill:#F06595,color:#fff,stroke:none
-    style E fill:#51CF66,color:#fff,stroke:none
-    style F fill:#FFB800,color:#fff,stroke:none
-```
+| Stage | What it does |
+|---|---|
+| **1. Raw Data** | `train.txt` · `test.txt` · `node_information.csv` |
+| ⬇ | |
+| **2. Feature Engineering** | 73 scalar features across 7 families |
+| ⬇ | |
+| **3. Self-Training** | one round, threshold 0.95, +332 pseudo-edges |
+| ⬇ | |
+| **4. Community + SVD** | 20-seed Louvain consensus + multi-resolution + low-rank adjacency SVD |
+| ⬇ | |
+| **5. HGB + CatBoost** | 30 random seeds each, rank-averaged 50/50 |
+| ⬇ | |
+| **6. Final** | **0.88822 AUC** 🥇 1st place |
 
 The core insight behind our approach: **with only 10K training samples, scalar hand-crafted features massively outperform learned representations**. Every embedding-based method we tried at high dimension (Node2Vec, GCN, TabPFN, SEAL) overfit or flatlined. Instead, we engineered 73 carefully chosen scalar features, each targeting a different aspect of what makes two actors likely to co-occur. The six biggest jumps all came from fundamentally new information sources: pair-level transductive features (v24/v25, 0.867→0.872), global community structure on a label-free candidate graph (v26b/d, 0.872→0.8805), a second Louvain partition on a *text-weighted* variant of the same graph (v26g, 0.8805→0.88080), **consensus across 20 Louvain seeds** to denoise single-seed noise (v26h_pure, 0.88080→0.88432), **multi-resolution consensus** at 5 different Louvain resolutions (v26L, 0.88432→0.88491), **low-rank adjacency SVD cosine** as role-similarity features (v26Q, 0.88491→0.88653), and **SVD Hadamard products** exposing specific role axes element-wise (v26R, 0.88653→0.88822).
 
@@ -69,23 +67,23 @@ We build features that answer ten distinct questions about each node pair:
 
 **Node-level transductive features** — Big single improvement (+0.011 AUC). We count how many times each node appears across all pairs (train + test). Nodes appearing frequently in the test set likely had more edges deleted. We separate train-only and test-only counts and add interaction terms for richer signal.
 
-**Pair-level transductive features (v24 — +0.003 AUC, then v25 — another +0.001 AUC)** — Pushing the transductive insight one order higher: instead of counting node appearances, we look at *shared partners across the test set*. For each pair $(u, v)$:
+**Pair-level transductive features (v24 — +0.003 AUC, then v25 — another +0.001 AUC)** — Pushing the transductive insight one order higher: instead of counting node appearances, we look at *shared partners across the test set*. For each pair `(u, v)`:
 
 *v24 features (7):*
-- $\text{test\_partners}(u)$ = set of nodes that appear in some test pair with $u$
-- $|\text{test\_partners}(u) \cap \text{test\_partners}(v)|$ — how many other nodes are "test partners" of both $u$ and $v$
+- `test_partners(u)` = set of nodes that appear in some test pair with `u`
+- `|test_partners(u) ∩ test_partners(v)|` — how many other nodes are "test partners" of both `u` and `v`
 - Same for train partners and combined train+test partners
 - Jaccard variants of these intersections
-- min/max of $|\text{test\_partners}|$ on each side
+- min/max of `|test_partners|` on each side
 
 *v25 features (8) — same direction, higher order:*
-- `test_triangles` = $|\{w : (u,w) \in \text{test} \land (w,v) \in \text{test}\}|$ — paths of length 2 through the test set
+- `test_triangles` = `|{w : (u,w) and (w,v) both in test pairs}|` — paths of length 2 through the test set
 - `train_triangles` = same with train pairs
-- `mixed_triangles` = $|\{w : (u,w) \in \text{train} \land (w,v) \in \text{test}\}|$ + symmetric
-- `shared_test_aa` = $\sum_{w \in \text{shared}} 1/\log(\text{test\_count}(w))$ — Adamic-Adar style on the test partner space
+- `mixed_triangles` = `|{w : (u,w) in train and (w,v) in test}|` + symmetric
+- `shared_test_aa` = `Σ 1/log(test_count(w))` over shared test partners — Adamic-Adar style on the test partner space
 - `shared_test_ra` = resource-allocation variant
-- `shared_total_pa` = $|\text{test\_partners}(u)| \cdot |\text{test\_partners}(v)|$ — preferential attachment in test space
-- `exclusive_test_u` = $|\text{test\_partners}(u) \setminus \text{test\_partners}(v)|$ + symmetric
+- `shared_total_pa` = `|test_partners(u)| × |test_partners(v)|` — preferential attachment in test space
+- `exclusive_test_u` = `|test_partners(u) \ test_partners(v)|` + symmetric
 
 These features are **leakage-free** (no labels used) but reveal a form of higher-order structure that v19's node-level counts cannot capture: if two actors share many test partners, they likely belong to the same cluster in the original graph and the edge between them was probably one of those that got deleted. On training data the signal is sparse but strongly directional: positive pairs have on average **12× more shared test partners** than negative pairs (v24 features), and **23× more test triangles** (v25 features).
 
